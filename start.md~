@@ -1,9 +1,0 @@
-1. docker-compose up -d
-2. Открываем http://localhost:8888
-3. docker exec -it jupyter-notebook bash
-    3.1. jupyter server list
-    3.2. Копируем значение token и вставляем его на странице http://localhost:8888
-4. Запускаем файл to_notebook
-5. переходим на http://localhost:8888 и открываем папку work
-6. поэтапно запускаем файлы main.ipynb
-
