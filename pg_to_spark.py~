@@ -1,0 +1,149 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, to_date, year, quarter, month, dayofmonth, date_format
+import os
+
+# --- Параметры подключения к PostgreSQL ---
+PG_HOST = os.getenv("DB_HOST", "db_postgres")
+PG_PORT = os.getenv("DB_PORT", "5432")
+PG_DB   = os.getenv("DB_NAME", "user_db")
+PG_USER = os.getenv("DB_USER", "user")
+PG_PASS = os.getenv("DB_PASSWORD", "password")
+JDBC_URL = f"jdbc:postgresql://{PG_HOST}:{PG_PORT}/{PG_DB}"
+JDBC_PROPS = {
+    "user": PG_USER,
+    "password": PG_PASS,
+    "driver": "org.postgresql.Driver"
+}
+
+# --- Инициируем SparkSession ---
+spark = SparkSession.builder \
+    .appName("ETL Star Schema") \
+    .config("spark.jars", "/opt/bitnami/spark/external-jars/postgresql-42.5.4.jar") \
+    .getOrCreate()
+
+# --- 1) Читаем исходную таблицу mock_data ---
+raw_df = spark.read \
+    .format("jdbc") \
+    .option("url", JDBC_URL) \
+    .option("dbtable", "mock_data") \
+    .option("user", PG_USER) \
+    .option("password", PG_PASS) \
+    .load()
+
+# Приводим sale_date к типу Date
+stg = raw_df.withColumn("sale_date", to_date(col("sale_date"), "M/d/yyyy"))
+
+# --- 2) Формируем измерение dates ---
+dim_dates = stg.select(col("sale_date").alias("full_date")) \
+    .distinct() \
+    .withColumn("year", year("full_date")) \
+    .withColumn("quarter", quarter("full_date")) \
+    .withColumn("month", month("full_date")) \
+    .withColumn("day", dayofmonth("full_date")) \
+    .withColumn("weekday", date_format(col("full_date"), "EEEE"))
+
+# Записываем dim_dates (Postgres назначит date_id автоматически)
+dim_dates.write \
+    .mode("append") \
+    .jdbc(JDBC_URL, "dim_dates", properties=JDBC_PROPS)
+
+# --- 3) Формируем измерение customers ---
+dim_cust = raw_df.select(
+    col("sale_customer_id").alias("customer_key"),
+    col("customer_first_name").alias("first_name"),
+    col("customer_last_name").alias("last_name"),
+    col("customer_age").alias("age"),
+    col("customer_email").alias("email"),
+    col("customer_country").alias("country_name"),
+    col("customer_postal_code").alias("postal_code"),
+    col("customer_pet_name").alias("pet_name")
+).distinct()
+
+# Предполагаем, что dim_countries и dim_pets уже загружены либо загружаем аналогично
+# Здесь просто пишем customers (Postgres назначит customer_id и свяжет FK по country_id/pet_id при внешних ключах)
+dim_cust.write \
+    .mode("append") \
+    .jdbc(JDBC_URL, "dim_customers", properties=JDBC_PROPS)
+
+# --- 4) Формируем измерение sellers аналогично ---
+dim_sellers = raw_df.select(
+    col("sale_seller_id").alias("seller_key"),
+    col("seller_first_name").alias("first_name"),
+    col("seller_last_name").alias("last_name"),
+    col("seller_email").alias("email"),
+    col("seller_country").alias("country_name"),
+    col("seller_postal_code").alias("postal_code")
+).distinct()
+
+dim_sellers.write \
+    .mode("append") \
+    .jdbc(JDBC_URL, "dim_sellers", properties=JDBC_PROPS)
+
+# --- 5) Формируем измерение products ---
+dim_products = raw_df.select(
+    col("sale_product_id").alias("product_key"),
+    col("product_name").alias("product_name"),
+    col("product_category").alias("category_name"),
+    col("product_price").alias("price"),
+    col("product_weight").alias("weight"),
+    col("product_color").alias("color_name"),
+    col("product_size").alias("size_name"),
+    col("product_brand").alias("brand_name"),
+    col("product_material").alias("material_name"),
+    col("product_description").alias("description"),
+    col("product_rating").alias("rating"),
+    col("product_reviews").alias("reviews"),
+    to_date(col("product_release_date"), "M/d/yyyy").alias("release_date"),
+    to_date(col("product_expiry_date"), "M/d/yyyy").alias("expiry_date"),
+    col("supplier_name").alias("supplier_name")
+).distinct()
+
+dim_products.write \
+    .mode("append") \
+    .jdbc(JDBC_URL, "dim_products", properties=JDBC_PROPS)
+
+# --- 6) Формируем измерение stores ---
+dim_stores = raw_df.select(
+    col("store_name"),
+    col("store_location").alias("location"),
+    col("store_city").alias("city_name"),
+    col("store_state").alias("state"),
+    col("store_country").alias("country_name"),
+    col("store_phone").alias("phone"),
+    col("store_email").alias("email")
+).distinct()
+
+dim_stores.write \
+    .mode("append") \
+    .jdbc(JDBC_URL, "dim_stores", properties=JDBC_PROPS)
+
+# --- 7) Формируем фактовую таблицу sales ---
+# Для корректных внешних ключей: подгружаем только что созданные измерения из PostgreSQL
+dates_df    = spark.read.jdbc(JDBC_URL, "dim_dates", properties=JDBC_PROPS)
+custs_df    = spark.read.jdbc(JDBC_URL, "dim_customers", properties=JDBC_PROPS)
+sellers_df  = spark.read.jdbc(JDBC_URL, "dim_sellers", properties=JDBC_PROPS)
+prods_df    = spark.read.jdbc(JDBC_URL, "dim_products", properties=JDBC_PROPS)
+stores_df   = spark.read.jdbc(JDBC_URL, "dim_stores", properties=JDBC_PROPS)
+
+# Джойним staging на surrogate keys
+sales_fact = stg \
+    .join(dates_df,    stg.sale_date     == dates_df.full_date) \
+    .join(custs_df,    stg.sale_customer_id == custs_df.customer_key) \
+    .join(sellers_df,  stg.sale_seller_id   == sellers_df.seller_key) \
+    .join(prods_df,    stg.sale_product_id  == prods_df.product_key) \
+    .join(stores_df,   stg.store_name       == stores_df.store_name) \
+    .select(
+        col("date_id"),
+        col("customer_id"),
+        col("seller_id"),
+        col("product_id"),
+        col("store_id"),
+        col("sale_quantity").alias("quantity"),
+        col("sale_total_price").alias("total_price")
+    )
+
+sales_fact.write \
+    .mode("append") \
+    .jdbc(JDBC_URL, "fact_sales", properties=JDBC_PROPS)
+
+spark.stop()

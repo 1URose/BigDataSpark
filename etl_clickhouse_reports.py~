@@ -1,0 +1,221 @@
+from pyspark.sql import SparkSession
++from pyspark.sql.functions import (
+    col,
+    sum as _sum,
+    avg as _avg,
+    count as _count,
+    min as _min,
+    max as _max,
+    month,
+    year,
+    date_format
+)
+import os
+
+# -------------------
+# Параметры подключения
+# -------------------
+# PostgreSQL
+PG_HOST = os.getenv("DB_HOST", "db_postgres")
+PG_PORT = os.getenv("DB_PORT", "5432")
+PG_DB   = os.getenv("DB_NAME", "user_db")
+PG_USER = os.getenv("DB_USER", "user")
+PG_PASS = os.getenv("DB_PASSWORD", "password")
+PG_URL  = f"jdbc:postgresql://{PG_HOST}:{PG_PORT}/{PG_DB}"
+PG_PROPS = {
+    "user": PG_USER,
+    "password": PG_PASS,
+    "driver": "org.postgresql.Driver"
+}
+
+# ClickHouse
+CH_HOST = os.getenv("CH_HOST", "clickhouse_server")
+CH_PORT = os.getenv("CH_PORT", "8123")
+CH_DB   = os.getenv("CH_DB", "default")
+CH_URL  = f"jdbc:clickhouse://{CH_HOST}:{CH_PORT}/{CH_DB}"
+CH_PROPS = {
+    "driver": "ru.yandex.clickhouse.ClickHouseDriver"
+}
+
+# -------------------
+# Инициализация Spark
+# -------------------
+spark = SparkSession.builder \
+    .appName("ETL ClickHouse Reports") \
+    .config("spark.jars",
+        "/opt/bitnami/spark/external-jars/postgresql-42.5.4.jar,"
+        "/opt/bitnami/spark/external-jars/clickhouse-jdbc-0.3.2-pg.jar"
+    ) \
+    .getOrCreate()
+
+# -------------------
+# Чтение данных из Postgres
+# -------------------
+fact = spark.read.jdbc(PG_URL, "fact_sales", PG_PROPS)
+dim_prod    = spark.read.jdbc(PG_URL, "dim_products", PG_PROPS)
+dim_cust    = spark.read.jdbc(PG_URL, "dim_customers", PG_PROPS)
+dim_store   = spark.read.jdbc(PG_URL, "dim_stores", PG_PROPS)
+dim_supplier= spark.read.jdbc(PG_URL, "dim_suppliers", PG_PROPS)
+dim_date    = spark.read.jdbc(PG_URL, "dim_dates", PG_PROPS)
+
+# Джойним факт с нужными справочниками
+stg = fact \
+    .join(dim_prod,    fact.product_id   == dim_prod.product_id,   "left") \
+    .join(dim_cust,    fact.customer_id  == dim_cust.customer_id,  "left") \
+    .join(dim_store,   fact.store_id     == dim_store.store_id,    "left") \
+    .join(dim_supplier,fact.product_id   == dim_prod.product_id,   "left") \
+    .join(dim_date,    fact.date_id      == dim_date.date_id,      "left") \
+    .select(
+        # Поля для агрегаций
+        dim_prod.product_id, dim_prod.product_name, dim_prod.category_id,
+        dim_prod.price, dim_prod.rating, dim_prod.reviews,
+        dim_cust.customer_id, dim_cust.country_id.alias("cust_country_id"),
+        dim_store.store_id, dim_store.city_id.alias("store_city_id"),
+        dim_supplier.supplier_id, dim_supplier.country_id.alias("sup_country_id"),
+        dim_date.full_date
+    , fact.quantity, fact.total_price)
+
+# -------------------
+# 1. Витрина продаж по продуктам
+#   - топ-10 по количеству
+#   - выручка по категориям
+#   - средний рейтинг и кол-во отзывов
+# -------------------
+# 1.1 Топ-10 продуктов
+r1 = stg.groupBy("product_id", "product_name") \
+    .agg(_sum("quantity").alias("total_qty")) \
+    .orderBy(col("total_qty").desc()) \
+    .limit(10)
+
+# 1.2 Выручка по категориям
+r2 = stg.groupBy("category_id") \
+    .agg(_sum("total_price").alias("revenue"))
+
+# 1.3 Средний рейтинг и отзывы
+r3 = stg.groupBy("product_id", "product_name") \
+    .agg(
+       _avg("rating").alias("avg_rating"),
+       _sum("reviews").alias("total_reviews")
+    )
+
+r1.write.jdbc(CH_URL, "sales_by_product_top10", CH_PROPS)
+r2.write.jdbc(CH_URL, "sales_by_category",    CH_PROPS)
+r3.write.jdbc(CH_URL, "product_rating_reviews", CH_PROPS)
+
+# -------------------
+# 2. Витрина продаж по клиентам
+#   - топ-10 по сумме покупок
+#   - распределение по странам
+#   - средний чек
+# -------------------
+r4 = stg.groupBy("customer_id") \
+    .agg(_sum("total_price").alias("total_spent")) \
+    .orderBy(col("total_spent").desc()) \
+    .limit(10)
+
+r5 = stg.groupBy("cust_country_id") \
+    .agg(_count("customer_id").alias("num_customers"))
+
+r6 = stg.groupBy("customer_id") \
+    .agg(
+      (_sum("total_price")/_sum("1")).alias("avg_ticket")
+    )
+
+r4.write.jdbc(CH_URL, "sales_by_customer_top10", CH_PROPS)
+r5.write.jdbc(CH_URL, "customers_by_country",     CH_PROPS)
+r6.write.jdbc(CH_URL, "avg_ticket_by_customer",   CH_PROPS)
+
+# -------------------
+# 3. Витрина продаж по времени
+#   - месячные и годовые тренды
+#   - сравнение выручки
+#   - средний чек по месяцам
+# -------------------
+r7 = stg.groupBy(year("full_date").alias("year")) \
+    .agg(_sum("total_price").alias("yearly_revenue"))
+
+r8 = stg.groupBy(month("full_date").alias("month")) \
+    .agg(_sum("total_price").alias("monthly_revenue"))
+
+r9 = stg.groupBy(month("full_date")) \
+    .agg(
+      (_sum("total_price")/_count("quantity")).alias("avg_monthly_ticket")
+    )
+
+r7.write.jdbc(CH_URL, "revenue_by_year",   CH_PROPS)
+r8.write.jdbc(CH_URL, "revenue_by_month",  CH_PROPS)
+r9.write.jdbc(CH_URL, "avg_ticket_by_month", CH_PROPS)
+
+# -------------------
+# 4. Витрина продаж по магазинам
+#   - топ-5 по выручке
+#   - распределение по городам/странам
+#   - средний чек на магазин
+# -------------------
+r10 = stg.groupBy("store_id") \
+    .agg(_sum("total_price").alias("store_revenue")) \
+    .orderBy(col("store_revenue").desc()) \
+    .limit(5)
+
+r11 = stg.groupBy("store_city_id") \
+    .agg(_count("store_id").alias("stores_count"))
+
+r12 = stg.groupBy("store_id") \
+    .agg((_sum("total_price")/_sum("quantity")).alias("avg_store_ticket"))
+
+r10.write.jdbc(CH_URL, "top5_stores_by_revenue", CH_PROPS)
+r11.write.jdbc(CH_URL, "stores_by_city",         CH_PROPS)
+r12.write.jdbc(CH_URL, "avg_ticket_by_store",    CH_PROPS)
+
+# -------------------
+# 5. Витрина продаж по поставщикам
+#   - топ-5 по выручке
+#   - средняя цена товаров
+#   - распределение по странам
+# -------------------
+r13 = stg.groupBy("supplier_id") \
+    .agg(_sum("total_price").alias("supplier_revenue")) \
+    .orderBy(col("supplier_revenue").desc()) \
+    .limit(5)
+
+r14 = stg.groupBy("supplier_id") \
+    .agg(_avg("price").alias("avg_price"))
+
+r15 = stg.groupBy("sup_country_id") \
+    .agg(_count("supplier_id").alias("suppliers_count"))
+
+r13.write.jdbc(CH_URL, "top5_suppliers_by_revenue", CH_PROPS)
+r14.write.jdbc(CH_URL, "avg_price_by_supplier",      CH_PROPS)
+r15.write.jdbc(CH_URL, "suppliers_by_country",       CH_PROPS)
+
+# -------------------
+# 6. Витрина качества продукции
+#   - наивысший и наименьший рейтинг
+#   - корреляция рейтинг–объём
+#   - продукты с наибольшими отзывами
+# -------------------
+# 6.1 min/max rating
+r16 = stg.groupBy("product_id", "product_name") \
+    .agg(
+      _min("rating").alias("min_rating"),
+      _max("rating").alias("max_rating")
+    )
+
+# 6.2 корреляция
+corr_val = stg.stat.corr("rating", "quantity")
+
+# 6.3 топ по отзывам
+r17 = stg.groupBy("product_id", "product_name") \
+    .agg(_sum("reviews").alias("total_reviews")) \
+    .orderBy(col("total_reviews").desc())
+
+r16.write.jdbc(CH_URL, "rating_min_max",     CH_PROPS)
+r17.write.jdbc(CH_URL, "top_products_by_reviews", CH_PROPS)
+
+# Запишем корреляцию в простую таблицу
+spark.createDataFrame(
+    [(corr_val,)],
+    ["rating_quantity_correlation"]
+).write.jdbc(CH_URL, "rating_qty_correlation", CH_PROPS)
+
+spark.stop()
